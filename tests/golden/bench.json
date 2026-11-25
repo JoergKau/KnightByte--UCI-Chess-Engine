@@ -1,0 +1,15 @@
+{
+  "6": {
+    "total_nodes": 7553,
+    "note": "Pinned totals of the 1.0 search with every node counted once. The search tree is identical to the earlier pins 15,081 / 384,626 / 3,566,459 / 9,878,833; only the counter changed: a position that dropped from the main search into quiescence used to be counted twice. Per-position counts for depths 1-18 are in search_parity.json."
+  },
+  "12": {
+    "total_nodes": 203939
+  },
+  "16": {
+    "total_nodes": 1285264
+  },
+  "18": {
+    "total_nodes": 3668723
+  }
+}

@@ -1,0 +1,341 @@
+//! Quiescence search.
+//!
+//! A static evaluation is only trustworthy once the tactical dust has settled.
+//! Quiescence extends the search with captures until no favourable capture
+//! remains, which prevents the horizon effect where a search evaluates a
+//! position one ply before a queen is lost.
+//!
+//! The node order follows the ported reference exactly, because node counts are
+//! the parity gate:
+//!
+//! 1. count the node, poll for a stop, track selective depth;
+//! 2. stop at ply 100, then apply draw detection;
+//! 3. detect check and probe the table (only depth-0 entries may cut here);
+//! 4. in check: seed a mated score and search every evasion;
+//! 5. not in check: stand pat, fail-soft return on `stand >= beta`, then
+//!    node-level delta pruning;
+//! 6. captures in ordering order, filtered by the approximate-SEE prefilter and
+//!    a `-50` bound;
+//! 7. a fail-high breaks the loop and the result is averaged with beta
+//!    (`use_micro_riders`);
+//! 8. store the result at depth 0.
+//!
+//! Quiet promotions are not quiescence moves: the reference classifies a move
+//! as a capture only by its target square, so a promotion to an empty square is
+//! skipped.
+
+use crate::board::movegen;
+use crate::board::position::Position;
+use crate::search::MAX_PLY;
+use crate::search::history::Previous;
+use crate::search::searcher::{
+    DRAW_SCORE, MATE_LIMIT, NO_STATIC_EVAL, Searcher, mated_in, tt_entry,
+};
+use crate::search::see::{see_approximate, see_ge};
+use crate::search::tt::Bound;
+use crate::types::r#move::Move;
+use crate::types::piece::EMPTY;
+
+/// Largest losing exchange that quiescence still searches.
+const SEE_THRESHOLD: i32 = -50;
+
+impl Searcher {
+    /// Resolves captures at a node that the caller has not counted yet: a
+    /// child entered from a capture loop or from the probe of an earlier
+    /// stage. The node is counted here, once.
+    #[inline]
+    pub(crate) fn quiescence<const STATS: bool>(
+        &mut self,
+        position: &Position,
+        alpha: i32,
+        beta: i32,
+        ply: usize,
+        previous: Option<Previous>,
+    ) -> i32 {
+        self.nodes += 1;
+        self.quiescence_counted::<STATS>(position, alpha, beta, ply, previous)
+    }
+
+    /// Resolves captures at a node that is already in the node count.
+    ///
+    /// [`Searcher::negamax`] counts every node it enters before it knows
+    /// whether the node leaves the main search (remaining depth zero, a
+    /// razoring drop, the drop after the depth adjustments). Those hand-offs
+    /// call this entry point so the position is counted once and not a second
+    /// time on entering quiescence (bug B56: the double count inflated every
+    /// reported node total and NPS by about 1.4 and changed nothing in the
+    /// tree). Everything else is identical to [`Searcher::quiescence`].
+    pub(crate) fn quiescence_counted<const STATS: bool>(
+        &mut self,
+        position: &Position,
+        mut alpha: i32,
+        beta: i32,
+        ply: usize,
+        previous: Option<Previous>,
+    ) -> i32 {
+        if STATS {
+            self.stats.qnodes += 1;
+        }
+        crate::node_stat!(QsearchNodes);
+        if ply > self.seldepth {
+            self.seldepth = ply;
+        }
+        if self.should_stop() {
+            return 0;
+        }
+        if ply >= 100 || ply >= MAX_PLY - 1 {
+            return self.evaluator.evaluate(position);
+        }
+        if ply > 0 && self.is_draw(position, ply) {
+            return DRAW_SCORE;
+        }
+        self.keys[ply] = position.key();
+
+        let in_check = self.params.use_check_aware_quiescence && position.in_check(position.side());
+
+        // Exact tablebase values. A checkmate inside the tables must be
+        // reported as a mate, not as the flat tablebase loss: only that one
+        // node type (in check and no legal move) diverges from returning the
+        // exact value, and every other in-check position keeps it.
+        let tb_wdl = self.tb_wdl(position);
+        if in_check && tb_wdl.is_some() && movegen::legal(position).is_empty() {
+            return mated_in(ply as i32);
+        }
+        if let Some(wdl) = tb_wdl {
+            return crate::tb::syzygy::wdl_to_score(wdl);
+        }
+
+        let mut tt_eval: Option<i32> = None;
+        let mut tt_probe: Option<crate::search::tt::TtEntry> = None;
+        let qs_found = if self.params.use_qs_tt_probe {
+            let found = self.tables.tt.probe(position.key());
+            if STATS {
+                self.stats.record_qtt_probe(found.is_some());
+            }
+            found
+        } else {
+            None
+        };
+        if let Some(entry) = qs_found {
+            tt_probe = Some(entry);
+            let stored_eval = i32::from(entry.eval);
+            if stored_eval != NO_STATIC_EVAL {
+                tt_eval = Some(stored_eval);
+            }
+            if entry.depth == 0 {
+                let score = Self::probe_score(&entry, ply);
+                let usable = match entry.bound {
+                    Bound::Exact => true,
+                    Bound::Lower => score >= beta,
+                    Bound::Upper => score <= alpha,
+                };
+                if usable {
+                    return score;
+                }
+            }
+        }
+
+        let alpha_original = alpha;
+        let mut best_score;
+        let mut static_eval = NO_STATIC_EVAL;
+        let mut stand;
+
+        if in_check {
+            best_score = mated_in(ply as i32);
+        } else {
+            stand = tt_eval.unwrap_or_else(|| self.evaluate_stacked(position, ply));
+            static_eval = stand;
+
+            if self.params.use_tt_score_eval
+                && let Some(entry) = tt_probe
+                && Self::can_use_tt_score(&entry, stand, ply)
+            {
+                stand = Self::probe_score(&entry, ply);
+            }
+
+            // Correction history in quiescence (off by default, lever
+            // `UseQsCorrectionHistory`): the stand-pat gets the same learned
+            // offset the main search applies, so the score does not jump by the
+            // correction at the boundary. The cached evaluation (`static_eval`)
+            // stays raw, and a node that has a table move gets no correction,
+            // exactly like the main search.
+            if self.params.use_qs_correction_history
+                && self.params.use_correction_history
+                && self.params.use_ref_correction_history
+                && !tt_probe.is_some_and(|entry| !entry.mv.is_none())
+            {
+                let correction = self.correction.correction(position, previous);
+                stand = self.correction.corrected_eval(stand, correction);
+            }
+
+            if stand >= beta {
+                let returned = if self.params.use_micro_riders {
+                    stand
+                } else {
+                    beta
+                };
+                self.store_tt(tt_entry(
+                    position,
+                    ply,
+                    0,
+                    returned,
+                    static_eval,
+                    Bound::Lower,
+                    Move::NONE,
+                ));
+                return returned;
+            }
+            if alpha < stand {
+                alpha = stand;
+            }
+
+            // Delta pruning: even the most valuable capture cannot reach alpha.
+            if stand + self.params.qs_delta_margin < alpha {
+                return alpha;
+            }
+            best_score = stand;
+        }
+
+        crate::node_stat!(QsearchMoveLists);
+        let moves = movegen::legal(position);
+        crate::node_stat!(PseudoMoves, moves.as_slice().len());
+        if in_check && moves.is_empty() {
+            return mated_in(ply as i32);
+        }
+        // Both quiescence shapes run through the staged picker: captures-only
+        // when not in check (good captures sorted, bad captures in generation
+        // order), the full picker for the evasions when in check.
+        self.picker[ply].reset(
+            Move::NONE,
+            &self.killers,
+            &self.history,
+            ply,
+            previous,
+            &[None; 4],
+            true,
+            !in_check,
+        );
+
+        let mut best_move = Move::NONE;
+        let mut legal_moves = 0;
+
+        while let Some(mv) = self.picker[ply].next(position, &self.history, moves.as_slice()) {
+            crate::node_stat!(MovesTried);
+            if self.params.use_qs_narrowing && !in_check {
+                if ply as i32 >= self.params.qs_promotion_max_ply && mv.is_promotion() {
+                    continue;
+                }
+                if ply as i32 >= self.params.qs_recapture_only_ply
+                    && let Some((_, _, target)) = previous
+                    && mv.to() != target
+                {
+                    continue;
+                }
+            }
+
+            // Quiet = the target square is empty, the move is not a promotion
+            // and it is not an en-passant capture. Bug B36 fix (reference bug
+            // 148): an en-passant capture lands on an EMPTY square, so the
+            // mailbox test alone classified it quiet and quiescence never
+            // searched it — although the move generator emits it as a capture.
+            // The flag is the authoritative marker; with the fix an
+            // en-passant capture takes the capture path below like any other.
+            let quiet = position.piece_at(mv.to()) == EMPTY
+                && !mv.is_promotion()
+                && mv.flag() != crate::types::r#move::flags::EN_PASSANT;
+            if !in_check {
+                if quiet {
+                    continue;
+                }
+                if self.params.use_see_approx_prefilter
+                    && see_approximate(position, mv) < SEE_THRESHOLD
+                {
+                    continue;
+                }
+                if !see_ge(position, mv, SEE_THRESHOLD) {
+                    continue;
+                }
+            }
+
+            let next = position.make_move(mv);
+            self.tables.tt.prefetch(next.key());
+            crate::node_stat!(MovesMade);
+            self.push_accumulators(position, &next, mv, ply);
+            self.move_stack[ply] = mv;
+            legal_moves += 1;
+            let score = -self.quiescence::<STATS>(
+                &next,
+                -beta,
+                -alpha,
+                ply + 1,
+                Some((position.piece_at(mv.from()), mv.from(), mv.to())),
+            );
+            if self.stopped {
+                return 0;
+            }
+
+            if score > best_score {
+                best_score = score;
+                best_move = mv;
+            }
+            if score >= beta {
+                if STATS {
+                    self.stats.record_qcutoff((legal_moves - 1) as usize);
+                }
+                if self.params.use_micro_riders {
+                    break;
+                }
+                return beta;
+            }
+            if score > alpha {
+                alpha = score;
+            }
+
+            // Evasion narrowing: once an evasion that is not getting mated has
+            // been found, stop searching further quiet evasions. Captures and
+            // promotions are ordered first and therefore already searched.
+            if in_check && quiet && legal_moves > 1 && best_score > -MATE_LIMIT {
+                break;
+            }
+        }
+
+        if in_check && legal_moves == 0 {
+            return mated_in(ply as i32);
+        }
+
+        let mut result = if in_check || (self.params.use_micro_riders && best_score >= beta) {
+            best_score
+        } else {
+            alpha
+        };
+        if self.params.use_micro_riders && result >= beta {
+            result = qs_fail_high_score(result, beta);
+        }
+
+        self.store_tt(tt_entry(
+            position,
+            ply,
+            0,
+            result,
+            static_eval,
+            if result >= beta {
+                Bound::Lower
+            } else if result > alpha_original {
+                Bound::Exact
+            } else {
+                Bound::Upper
+            },
+            best_move,
+        ));
+        result
+    }
+}
+
+/// Fail-soft averaging on a quiescence fail-high.
+fn qs_fail_high_score(score: i32, beta: i32) -> i32 {
+    if score >= beta && score.abs() < MATE_LIMIT && beta.abs() < MATE_LIMIT {
+        (score + beta) / 2
+    } else {
+        beta
+    }
+}

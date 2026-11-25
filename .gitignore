@@ -1,0 +1,25 @@
+# Rust build output (host-specific, never published)
+/target/
+
+# Local opening books and other third-party material (never published)
+/books/
+
+# Release artifacts and local scratch trees
+/dist/
+/matches/
+/pgo-work*/
+
+# Local benchmark output and captures
+*.pgn
+*.log
+*.profraw
+*.profdata
+kb_*.txt
+ref_*.txt
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Python bytecode
+__pycache__/

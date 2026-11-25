@@ -1,0 +1,50 @@
+[package]
+name = "knightbyte"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+description = "A UCI chess engine written in Rust"
+publish = false
+
+[dependencies]
+# Read-only memory mapping for tablebase files: a 3-4-5 set is roughly one
+# gigabyte, so it is mapped lazily instead of copied into the heap.
+memmap2 = "0.9"
+
+[features]
+# Compile-time node counters for the performance composition report.
+# Off by default: the counters are diagnostic and add atomic traffic.
+node-stats = []
+# Research-only network override (`KNIGHTBYTE_NET`). Never shipped and never
+# advertised as a UCI option: release builds keep the embedded network.
+research-net = []
+
+[dev-dependencies]
+# Test-only dependency used to verify the embedded network checksum.
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = false
+debug-assertions = false
+incremental = false
+
+# Profiling-only profile: keeps line tables and symbols so a sampler can map
+# samples back to source. Never shipped; the release artifact stays stripped.
+[profile.release-with-debug]
+inherits = "release"
+strip = "none"
+debug = 1
+
+[lints.rust]
+warnings = "deny"
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"
